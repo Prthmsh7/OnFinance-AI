@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 import mermaid from 'mermaid';
 
 mermaid.initialize({
@@ -41,7 +41,7 @@ export default function UMLViewer({ diagrams = [] }) {
     mermaid.render(id, src)
       .then(({ svg }) => setSvgMap((prev) => ({ ...prev, [key]: svg })))
       .catch((err) => setErrors((prev) => ({ ...prev, [key]: String(err) })));
-  }, [activeIdx, diagrams]);
+  }, [activeIdx, diagrams, svgMap]);
 
   const copySource = () => {
     const src = diagrams[activeIdx]?.mermaid_source;
