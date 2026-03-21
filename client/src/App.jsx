@@ -38,46 +38,60 @@ const IcEdit    = () => <Ico path={['M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2
 
 /* ─── Constants ─────────────────────────────────────── */
 const DIAGRAM_TYPES = [
-  { id: 'sequenceDiagram',  label: 'Sequence'  },
+  // { id: 'sequenceDiagram',  label: 'Sequence'  },
   { id: 'classDiagram',     label: 'Class'     },
   { id: 'flowchart',        label: 'Flowchart' },
-  { id: 'stateDiagram-v2',  label: 'State'     },
-  { id: 'componentDiagram', label: 'Component' },
+  // { id: 'stateDiagram-v2',  label: 'State'     },
+  // { id: 'componentDiagram', label: 'Component' },
 ];
-const DEFAULT_TYPES = ['sequenceDiagram', 'flowchart'];
+const DEFAULT_TYPES = ['classDiagram', 'flowchart'];
 
 const EXAMPLES = [
   { label: 'E-commerce checkout', prompt: 'An e-commerce system where users browse products, add to cart, checkout with Stripe, receive order confirmation, and the order is dispatched via a warehouse.' },
   { label: 'Microservices auth',  prompt: 'A microservices authentication system with API Gateway, Auth Service (JWT), User Service (PostgreSQL), Token Refresh, and Rate Limiter. Services communicate via REST.' },
   { label: 'SEBI compliance pipeline', prompt: 'A compliance monitoring system that ingests SEBI circulars via PDF/URL, parses them into clauses using an LLM, performs gap analysis against existing compliance setup, and generates reports for compliance officers.' },
 ];
-
 /* ─── Prompts ───────────────────────────────────────── */
-const DIAGRAM_SYSTEM_PROMPT = `You are a Mermaid.js diagram generator.
 
-CRITICAL RULES:
-- Return ONLY Mermaid code. No prose, no explanations.
-- Each diagram block: first line = // TYPE:<type>, second line = Mermaid keyword.
-  Example:  // TYPE:classDiagram  →  classDiagram
-            // TYPE:sequenceDiagram  →  sequenceDiagram
-            // TYPE:flowchart  →  flowchart TD
-- For classDiagram: classes at TOP LEVEL only (no nesting). Generics: List~Rule~ not List<Rule>. Return type after method, no colon: +getName() String
-- For componentDiagram: use flowchart TD + subgraph. NEVER use component/interface/[X]/<<stereotype>>.
-- Mermaid v10+ syntax only. No HTML tags in labels.`;
+const UNIFIED_PROCESS_PROMPT = `You are a systems analyst and Mermaid.js expert. Analyze the following request.
+Return a valid JSON object containing:
+1. "standardized_prompt": A concise, formal "canonical" version of the description.
+2. "model": The structured system model (entities, interactions, classes, etc.).
+3. "diagrams": A dictionary where keys are diagram types (sequenceDiagram, flowchart, etc.) and values are full Mermaid.js code.
 
-const MODEL_EXTRACT_PROMPT = `You are a systems analyst. Extract a structured system model from the description.
-Return ONLY valid JSON — no markdown, no prose.
-IMPORTANT: Always extract meaningful classes with attributes and methods even if not explicitly stated. Derive them from services, entities, and data objects in the system. Every entity should have a corresponding class.
-Schema: {"entities":[{"id":"CamelCase","type":"actor|service|database|queue|ui","label":"string"}],"interactions":[{"from":"id","to":"id","action":"string","type":"sync|async"}],"classes":[{"name":"string","attributes":["string"],"methods":["string"],"relations":[{"to":"string","label":"string","type":"inheritance|composition|aggregation|association"}]}],"states":[{"name":"string","transitions":[{"on":"string","to":"string"}]}],"dataFlows":[{"from":"id","to":"id","label":"string"}]}`;
+RULES for Model:
+- Use consistent entity IDs (CamelCase).
+- Extract classes, interactions, and data flows.
 
-/* ─── Cache (localStorage-backed for deterministic repeat outputs) ── */
+RULES for Diagrams:
+- Use Mermaid v10+ syntax.
+// - sequenceDiagram: use participant/actor.
+- flowchart: use flowchart TD.
+- classDiagram: use ~T~ for generics. No angle brackets. Visibility: + public, - private. No colon before return type (+method() String).
+// - componentDiagram: use flowchart TD + subgraph.
+
+Return ONLY valid JSON - no markdown, no prose.`;
+
+const UNIFIED_UPDATE_PROMPT = `You are a systems analyst and Mermaid.js expert. Update an existing system.
+Return a valid JSON object containing:
+1. "standardized_prompt": A canonical description of the UPDATED system.
+2. "model": The full updated system model.
+3. "diagrams": All updated Mermaid diagrams.
+
+Current Model:
+{{CURRENT_MODEL}}
+
+Follow same rules for JSON, Model, and Diagrams as the primary analysis.
+Return ONLY valid JSON.`;
+
+/* ─── Cache ─── */
 const CACHE_KEY = 'uml_gen_cache';
 const cache = (() => {
   try { return new Map(Object.entries(JSON.parse(localStorage.getItem(CACHE_KEY) || '{}'))); }
   catch { return new Map(); }
 })();
 function persistCache() {
-  try { localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(cache))); } catch {}
+  try { localStorage.setItem(CACHE_KEY, JSON.stringify(Object.fromEntries(cache))); } catch { /* ignore */ }
 }
 
 function normalizePrompt(text) {
@@ -87,14 +101,6 @@ function normalizePrompt(text) {
 }
 
 /* ─── Mermaid sanitizers ────────────────────────────── */
-const DIAGRAM_HEADERS = {
-  sequenceDiagram: 'sequenceDiagram',
-  classDiagram: 'classDiagram', 'classDiagram-v2': 'classDiagram',
-  flowchart: 'flowchart TD', 'flowchart TD': 'flowchart TD', 'flowchart LR': 'flowchart LR',
-  'stateDiagram-v2': 'stateDiagram-v2', stateDiagram: 'stateDiagram-v2',
-  componentDiagram: 'flowchart TD',
-  erDiagram: 'erDiagram',
-};
 
 function sanitizeClassDiagram(raw) {
   // Fix generics: List<X> → List~X~  (handle nested and multi-param generics)
@@ -103,7 +109,7 @@ function sanitizeClassDiagram(raw) {
     .replace(/(\w+)<([A-Za-z_][\w, ]*)>/g, (_, c, i) => `${c}~${i}~`)
     .replace(/<([^~>\n]{1,40})>/g, '~$1~');
   // Fix colon return types: +method() : void → +method() void
-  code = code.replace(/^(\s*[+\-#~][^\n]+\))\s*:\s*([\w~]+)\s*$/gm, '$1 $2');
+  code = code.replace(/^(\s*[+\-#~][^\n]+)\)\s*:\s*([\w~]+)\s*$/gm, '$1 $2');
   // Remove standalone <<stereotype>> lines
   code = code.replace(/^\s*<<[^>]+>>\s*$/gm, '');
   // Remove abstract/interface modifiers before class keyword
@@ -163,7 +169,7 @@ function sanitizeMermaid(code, type) {
   if (type === 'classDiagram' || type === 'classDiagram-v2') out = sanitizeClassDiagram(out);
   else if (type === 'sequenceDiagram') out = sanitizeSequenceDiagram(out);
   else if (type === 'componentDiagram') out = convertComponentToFlowchart(out);
-  else if (type === 'flowchart') out = out.replace(/(\[|\()([^\]\)]*)<([^>]*)>([^\]\)]*)/g, (_, o, p, i, q) => `${o}${p}&lt;${i}&gt;${q}`);
+  else if (type === 'flowchart') out = out.replace(/(\[|\()([^\])]*)<([^>]*)>([^\])]*)/g, (_, o, p, i, q) => `${o}${p}&lt;${i}&gt;${q}`);
   // Strip Windows CR characters
   out = out.replace(/\r/g, '');
   // Collapse whitespace-only lines
@@ -173,37 +179,7 @@ function sanitizeMermaid(code, type) {
   return out;
 }
 
-// Map common LLM type variations to our canonical type IDs
-const TYPE_ALIASES = {
-  class: 'classDiagram', classdiagram: 'classDiagram', 'class diagram': 'classDiagram',
-  sequence: 'sequenceDiagram', sequencediagram: 'sequenceDiagram', 'sequence diagram': 'sequenceDiagram',
-  flow: 'flowchart', flowchart: 'flowchart', 'flowchart td': 'flowchart', 'flowchart lr': 'flowchart',
-  state: 'stateDiagram-v2', statediagram: 'stateDiagram-v2', 'statediagram-v2': 'stateDiagram-v2', 'state diagram': 'stateDiagram-v2',
-  component: 'componentDiagram', componentdiagram: 'componentDiagram', 'component diagram': 'componentDiagram',
-  er: 'erDiagram', erdiagram: 'erDiagram',
-};
-function normalizeType(raw) { return TYPE_ALIASES[raw.toLowerCase().trim()] || raw.trim(); }
 
-function parseDiagrams(rawText) {
-  const result = {};
-  for (const block of rawText.split('---DIAGRAM---').map(s => s.trim()).filter(Boolean)) {
-    const m = block.match(/\/\/\s*TYPE:\s*([^\n]+)/);
-    if (!m) continue;
-    const type = normalizeType(m[1]);
-    let code = block.replace(/\/\/\s*TYPE:[^\n]+\n?/, '').trim()
-      .replace(/^```(?:mermaid)?\n?/i, '').replace(/\n?```\s*$/i, '').trim();
-
-    const reqHeader = DIAGRAM_HEADERS[type];
-    if (reqHeader) {
-      const firstWord = code.split('\n')[0].trim().split(/\s/)[0].toLowerCase();
-      const expectedWord = reqHeader.split(' ')[0].toLowerCase();
-      if (firstWord !== expectedWord) code = reqHeader + '\n' + code;
-    }
-
-    result[type] = sanitizeMermaid(code, type);
-  }
-  return result;
-}
 
 function validateJsonInput(text) {
   if (!text.trim().startsWith('{')) return { state: 'idle' };
@@ -285,7 +261,7 @@ export default function App() {
   const [zoom, setZoom]                           = useState(1);
 
   // Update mode: when set, next send applies a delta update instead of fresh generation
-  const [updateTarget, setUpdateTarget] = useState(null); // { origPrompt }
+  const [updateTarget, setUpdateTarget] = useState(null); // { origPrompt, origModel }
 
   // Layout
   const [splitPct, setSplitPct]     = useState(50);
@@ -296,6 +272,10 @@ export default function App() {
   const bottomRef   = useRef(null);
   const appRef      = useRef(null);
   const isDragging  = useRef(false);
+  const isProcessing = useRef(false);
+  const debounceTimer = useRef(null);
+  const abortController = useRef(null);
+  const requestId = useRef(0);
 
   /* ── Derived ── */
   const jsonState    = isJsonMode ? validateJsonInput(inputText) : { state: 'idle' };
@@ -334,262 +314,167 @@ export default function App() {
   };
 
   /* ── Gemini API call ── */
-  const callGeminiAPI = async (systemPrompt, userContent) => {
+  const callGeminiAPI = async (systemPrompt, userContent, signal) => {
     const body = JSON.stringify({
       systemInstruction: { parts: [{ text: systemPrompt }] },
       contents: [{ role: 'user', parts: [{ text: userContent }] }],
       generationConfig: { temperature: 0, topK: 1, topP: 0.1, maxOutputTokens: 8192 },
     });
     const tryModel = async (model) => {
-      const res = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`,
-        { method: 'POST', headers: { 'Content-Type': 'application/json' }, body }
-      );
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal });
       if (!res.ok) {
-        const { error } = await res.json().catch(() => ({ error: {} }));
-        const msg = error?.message || `API error ${res.status}`;
-        const isQuota = msg.toLowerCase().includes('quota') || msg.includes('RESOURCE_EXHAUSTED');
+        const msg = (await res.json().catch(() => ({}))).error?.message || res.statusText;
+        const isQuota = res.status === 429 || msg.toLowerCase().includes('quota');
         throw Object.assign(new Error(isQuota ? 'Quota exceeded — wait ~1 min or enable billing at console.cloud.google.com.' : msg), { isQuota });
       }
       return (await res.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
     };
     try { return await tryModel('gemini-2.5-flash-lite'); }
     catch (err) {
+      if (err.name === 'AbortError') throw err;
       if (err.isQuota) return await tryModel('gemini-2.5-flash');
       throw err;
     }
   };
 
-  /* ── Stage 1: extract structured system model ── */
-  const extractSystemModel = async (normPrompt) => {
-    const ck = 'model:' + normPrompt;
-    if (cache.has(ck)) try { return JSON.parse(cache.get(ck)); } catch {}
-    const raw = await callGeminiAPI(MODEL_EXTRACT_PROMPT, normPrompt);
-    // Strip markdown fences and any text before the first {
+  const unifiedAIProcess = async (userInput, types, origModel = null, signal = null, cacheKey = null) => {
+    const sys = origModel 
+      ? UNIFIED_UPDATE_PROMPT.replace('{{CURRENT_MODEL}}', JSON.stringify(origModel, null, 2))
+      : UNIFIED_PROCESS_PROMPT;
+    
+    const userContent = origModel 
+      ? `UPDATE REQUEST: ${userInput}\nApply to existing model.`
+      : userInput;
+
+    console.log('[Gemini API Call]', { type: origModel ? 'update' : 'extract', length: userInput.length });
+    const raw = await callGeminiAPI(sys, userContent, signal);
     const jsonStart = raw.indexOf('{');
-    if (jsonStart === -1) throw new Error('Model extraction returned no JSON object');
-    const json = raw.slice(jsonStart, raw.lastIndexOf('}') + 1);
-    const model = JSON.parse(json); // throws on bad JSON — caller catches and falls back
-    cache.set(ck, JSON.stringify(model));
+    if (jsonStart === -1) throw new Error('AI returned no JSON content');
+    const data = JSON.parse(raw.slice(jsonStart, raw.lastIndexOf('}') + 1));
+    
+    if (!data.model || !data.diagrams) throw new Error('Incomplete AI response — missing model or diagrams');
+    const std = data.standardized_prompt || userInput;
+
+    // Sanitize diagrams
+    for (const t of Object.keys(data.diagrams)) {
+      data.diagrams[t] = sanitizeMermaid(data.diagrams[t], t);
+    }
+
+    // Cache results
+    const stdKey = cacheKey || ('std:' + normalizePrompt(userInput));
+    cache.set(stdKey, std);
+    const normStd = normalizePrompt(std);
+    cache.set('model:' + normStd, JSON.stringify(data.model));
+    cache.set(normStd + '|' + [...types].sort().join(',') + ':diagrams', JSON.stringify(data.diagrams));
     persistCache();
-    return model;
+
+    return data;
   };
 
-  /* ── Stage 2: per-type prompt from shared model ── */
-  const buildDiagramPrompt = (model, type) => {
-    const reqHeader = DIAGRAM_HEADERS[type] || type;
-    const entityList = model.entities?.map(e => `${e.id}(${e.label})`).join(', ') || 'derived from system';
+  const processInteraction = async ({ prompt, types, isUpdate = false, origModel = null, origPrompt = null }) => {
+    if (abortController.current) abortController.current.abort();
+    abortController.current = new AbortController();
+    const signal = abortController.current.signal;
 
-    // Every response must start with this exact block so parseDiagrams can find it
-    const responsePrefix = `// TYPE:${type}\n${reqHeader}`;
-    const formatRule = `Return ONLY a Mermaid diagram. Start with:\n${responsePrefix}\n(then the diagram body — nothing else before or after)`;
-    const entityRule = `Entity IDs to use: ${entityList}. Do NOT rename or invent new ones.`;
+    const rid = ++requestId.current;
+    const taskType = isUpdate ? 'UPDATE' : 'GENERATE';
+    console.log(`[REQ_${rid}] Starting ${taskType} for: "${prompt.slice(0, 40)}..."`);
 
-    if (type === 'sequenceDiagram') {
-      const flows = model.interactions?.map(i => `  ${i.from}->>${i.to}: ${i.action}`).join('\n')
-        || '  Note over System: describe interactions';
-      return `${formatRule}\n${entityRule}\n\nInteractions to show (in order):\n${flows}`;
-    }
+    isProcessing.current = true;
+    setIsLoading(true);
 
-    if (type === 'classDiagram') {
-      const cls = model.classes?.length
-        ? model.classes.map(c => [
-            `Class: ${c.name}`,
-            `  Attributes: ${c.attributes?.join(', ') || 'none'}`,
-            `  Methods:    ${c.methods?.join(', ') || 'none'}`,
-            `  Relations:  ${c.relations?.map(r => `${r.type || r.label} -> ${r.to}`).join(', ') || 'none'}`,
-          ].join('\n')).join('\n\n')
-        : model.entities?.map(e => `Class: ${e.id}\n  Label: ${e.label}\n  Type: ${e.type}`).join('\n\n')
-          || 'Derive classes from the entities and interactions';
-      return `${formatRule}\n${entityRule}\n\nClass specifications:\n${cls}\n\nMermaid classDiagram syntax rules (MUST follow):\n- Generics: use ~T~ NEVER angle brackets (e.g. List~String~)\n- No nested class blocks\n- Visibility: + public, - private, # protected, ~ package\n- Return types WITHOUT colon: +getName() String\n- Relations: A --|> B (inherit), A --* B (composition), A --o B (aggregation), A --> B (association)\n- Do NOT use abstract/interface keyword before class\n- Do NOT use <<stereotype>> on standalone lines\n- Do NOT use namespace blocks`;
-    }
+    try {
+      setLoadingStage('analysing');
+      const fullContext = isUpdate ? `${origPrompt} ${prompt}` : prompt;
+      const normInput = normalizePrompt(fullContext);
+      const stdKey = 'std:' + normInput;
 
-    if (type === 'flowchart') {
-      const steps = model.interactions?.map(i => `  ${i.from} --> |${i.action}| ${i.to}`).join('\n') || '';
-      return `${formatRule}\n${entityRule}\n\nProcess flow (in order):\n${steps}`;
-    }
+      let stdPrompt = cache.has(stdKey) ? cache.get(stdKey) : null;
+      let model = null, diagrams = null;
 
-    if (type === 'stateDiagram-v2') {
-      // Prefer explicit states; fall back to deriving from interactions
-      let transitions = model.states?.flatMap(s =>
-        s.transitions?.map(t => `  ${s.name} --> ${t.to} : ${t.on}`) || []
-      ) || [];
-      if (transitions.length === 0 && model.interactions?.length) {
-        // Derive states from the unique actor/service names in interactions
-        const stateNames = [...new Set(model.interactions.flatMap(i => [i.from, i.to]))];
-        transitions = stateNames.slice(0, 8).map((s, idx, arr) =>
-          idx < arr.length - 1 ? `  ${s} --> ${arr[idx + 1]} : ${model.interactions[idx]?.action || 'event'}` : null
-        ).filter(Boolean);
-        transitions = [`  [*] --> ${stateNames[0]}`, ...transitions, `  ${stateNames[stateNames.length - 1]} --> [*]`];
+      if (stdPrompt) {
+        const normStd = normalizePrompt(stdPrompt);
+        const modelKey = 'model:' + normStd;
+        const diagKey = normStd + '|' + [...types].sort().join(',') + ':diagrams';
+        if (cache.has(modelKey)) model = JSON.parse(cache.get(modelKey));
+        if (cache.has(diagKey)) diagrams = JSON.parse(cache.get(diagKey));
       }
-      const stateBody = transitions.join('\n') || '  [*] --> Active\n  Active --> [*]';
-      return `${formatRule}\n${entityRule}\n\nState transitions:\n${stateBody}`;
-    }
 
-    if (type === 'componentDiagram') {
-      const serviceTypes = ['service', 'database', 'queue', 'ui'];
-      const nodes = model.entities
-        ?.filter(e => serviceTypes.includes(e.type))
-        .map(e => `  ${e.id}["${e.label}"]`).join('\n')
-        || model.entities?.map(e => `  ${e.id}["${e.label}"]`).join('\n') || '';
-      // Use dataFlows if present, otherwise derive from interactions
-      const edgeSrc = model.dataFlows?.length ? model.dataFlows : (model.interactions || []).map(i => ({ from: i.from, to: i.to, label: i.action }));
-      const edges = edgeSrc.map(f => `  ${f.from} --> |${f.label}| ${f.to}`).join('\n') || '';
-      return `${formatRule}\n${entityRule}\n\nComponent nodes:\n${nodes}\n\nConnections:\n${edges}\n\nGroup logically related components using subgraph blocks.`;
-    }
+      if (model && diagrams) {
+        console.log(`[REQ_${rid}] CACHE HIT. 0 API calls.`);
+      } else {
+        console.log(`[REQ_${rid}] CACHE MISS. Sending 1 Gemini API call...`);
+        const result = await unifiedAIProcess(prompt, types, origModel, signal, stdKey);
+        model = result.model;
+        diagrams = result.diagrams;
+        stdPrompt = result.standardized_prompt;
+      }
 
-    return `${formatRule}\n${entityRule}\n\nSystem model:\n${JSON.stringify(model, null, 2)}`;
+      if (signal.aborted) return;
+
+      const aiMsg = {
+        id: (Date.now() + rid).toString(), role: 'ai',
+        text: isUpdate ? `Updated diagram(s).` : `Generated ${Object.keys(diagrams).length} diagram(s).`,
+        diagrams, prompt: fullContext, model,
+      };
+
+      setMessages(prev => [...prev, aiMsg]);
+      setActiveDiagramMsg(aiMsg.id);
+      setActiveDiagramType(Object.keys(diagrams)[0] || null);
+
+      if (!isUpdate) {
+        setSessions(prev => [{ id: aiMsg.id, name: prompt.slice(0, 40) + (prompt.length > 40 ? '…' : ''), types }, ...prev]);
+        setActiveSession(aiMsg.id);
+      }
+      console.log(`[REQ_${rid}] SUCCESS.`);
+    } catch (err) {
+      if (err.name === 'AbortError') {
+        console.log(`[REQ_${rid}] ABORTED.`);
+      } else {
+        console.error(`[REQ_${rid}] FAILED:`, err);
+        showToast(err.message, 'err');
+      }
+    } finally {
+      if (!signal.aborted) {
+        setIsLoading(false);
+        setLoadingStage('');
+        isProcessing.current = false;
+      }
+    }
   };
 
-  /* ── Generate diagrams from model ── */
-  const generateFromModel = async (model, types, ck) => {
-    const diagCk = ck + ':diagrams';
-    if (cache.has(diagCk)) try { return JSON.parse(cache.get(diagCk)); } catch {}
-
-    const generateOne = async (type) => {
-      const raw = await callGeminiAPI(DIAGRAM_SYSTEM_PROMPT, buildDiagramPrompt(model, type));
-      let parsed = parseDiagrams(raw);
-
-      // Fallback: if parseDiagrams found nothing, extract diagram more aggressively
-      if (!parsed[type]) {
-        let clean = raw.replace(/^```(?:mermaid)?\n?/im, '').replace(/\n?```\s*$/im, '').trim();
-        // Strip any prose before the actual diagram keyword
-        const kwBase = (DIAGRAM_HEADERS[type] || type).split(' ')[0].toLowerCase();
-        const kwIdx = clean.toLowerCase().indexOf(kwBase);
-        if (kwIdx > 0) clean = clean.slice(kwIdx);
-        if (clean) {
-          const reqHeader = DIAGRAM_HEADERS[type];
-          const firstWord = clean.split('\n')[0].trim().split(/\s/)[0].toLowerCase();
-          if (reqHeader && firstWord !== reqHeader.split(' ')[0].toLowerCase()) {
-            clean = reqHeader + '\n' + clean;
-          }
-          parsed = { [type]: sanitizeMermaid(clean, type) };
-        }
-      }
-
-      // Validate syntax — discard bad diagrams instead of showing error UI
-      if (parsed[type]) {
-        try { await mermaid.parse(parsed[type]); }
-        catch { delete parsed[type]; }
-      }
-      return parsed;
-    };
-
-    // Stagger API calls in batches of 2 with delays to avoid rate limiting
-    const diagrams = {};
-    const failed = [];
-    for (let i = 0; i < types.length; i += 2) {
-      if (i > 0) await new Promise(r => setTimeout(r, 600));
-      const batch = types.slice(i, i + 2);
-      const results = await Promise.allSettled(batch.map(generateOne));
-      for (let j = 0; j < results.length; j++) {
-        if (results[j].status === 'fulfilled') Object.assign(diagrams, results[j].value);
-        else failed.push(batch[j]);
-      }
-    }
-    // Retry failed types once, sequentially with longer delay
-    for (const type of failed) {
-      await new Promise(r => setTimeout(r, 1000));
-      try { Object.assign(diagrams, await generateOne(type)); } catch { /* skip */ }
-    }
-
-    if (Object.keys(diagrams).length > 0) {
-      cache.set(diagCk, JSON.stringify(diagrams));
-      persistCache();
-    }
-    return diagrams;
-  };
-
-  /* ── Send message (two-stage pipeline) ── */
+  /* ── Send message (unified controller) ── */
   const sendMessage = async () => {
     if (!canSend) return;
     if (!apiKey) { showToast('Set VITE_GEMINI_API_KEY in your .env file', 'err'); return; }
 
-    let prompt = inputText.trim();
-    let types  = selectedTypes.length ? selectedTypes : DEFAULT_TYPES;
-    if (isJsonMode) {
-      if (jsonState.state !== 'valid') { showToast('Fix JSON before sending', 'err'); return; }
-      prompt = jsonState.data.prompt;
-      if (jsonState.data.diagram_types?.length) types = jsonState.data.diagram_types;
-    }
-
-    // If in update mode, delegate to updateDiagram
-    if (updateTarget) {
-      const orig = updateTarget.origPrompt;
-      setUpdateTarget(null);
-      return updateDiagram(prompt, orig, types);
-    }
-
-    const normPrompt = normalizePrompt(prompt);
-    const ck = normPrompt + '|' + [...types].sort().join(',');
-
-    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: prompt }]);
-    setInputText('');
-    setIsLoading(true);
-
-    try {
-      setLoadingStage('extracting');
-      let model = null;
-      try { model = await extractSystemModel(normPrompt); } catch { /* fall through to single-shot */ }
-
-      setLoadingStage('generating');
-      let diagrams;
-      const diagCk = ck + ':diagrams';
-      if (model) {
-        diagrams = await generateFromModel(model, types, ck);
-      } else if (cache.has(diagCk)) {
-        try { diagrams = JSON.parse(cache.get(diagCk)); } catch { diagrams = {}; }
-      } else {
-        diagrams = parseDiagrams(await callGeminiAPI(DIAGRAM_SYSTEM_PROMPT,
-            `Generate Mermaid diagrams for:\n${prompt}\nTypes: ${types.join(', ')}\nPrefix each: // TYPE:<type>\nSeparate with: ---DIAGRAM---`));
-        // Validate each diagram — drop any with syntax errors
-        for (const t of Object.keys(diagrams)) {
-          try { await mermaid.parse(diagrams[t]); } catch { delete diagrams[t]; }
-        }
-        if (Object.keys(diagrams).length > 0) {
-          cache.set(diagCk, JSON.stringify(diagrams));
-          persistCache();
-        }
+    if (debounceTimer.current) clearTimeout(debounceTimer.current);
+    debounceTimer.current = setTimeout(() => {
+      let prompt = inputText.trim();
+      let types  = selectedTypes.length ? selectedTypes : DEFAULT_TYPES;
+      
+      if (isJsonMode) {
+        if (jsonState.state !== 'valid') { showToast('Fix JSON before sending', 'err'); return; }
+        prompt = jsonState.data.prompt;
+        if (jsonState.data.diagram_types?.length) types = jsonState.data.diagram_types;
       }
 
-      const aiMsg = {
-        id: (Date.now() + 1).toString(), role: 'ai',
-        text: Object.keys(diagrams).length
-          ? `Generated ${Object.keys(diagrams).length} diagram(s): ${Object.keys(diagrams).join(', ')}`
-          : 'Generated diagrams — click a type above to preview.',
-        diagrams, prompt, model,
-      };
-      setMessages(prev => [...prev, aiMsg]);
-      setActiveDiagramMsg(aiMsg.id);
-      setActiveDiagramType(Object.keys(diagrams)[0] || null);
-      setSessions(prev => [{ id: aiMsg.id, name: prompt.slice(0, 40) + (prompt.length > 40 ? '…' : ''), types }, ...prev]);
-      setActiveSession(aiMsg.id);
-    } catch (err) {
-      setMessages(prev => [...prev, { id: (Date.now()+1).toString(), role: 'ai', text: `❌ Error: ${err.message}`, diagrams: {}, prompt }]);
-      showToast(err.message, 'err');
-    } finally {
-      setIsLoading(false);
-      setLoadingStage('');
-    }
+      if (updateTarget) {
+        const { origPrompt, origModel } = updateTarget;
+        setUpdateTarget(null);
+        setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: `🔄 Update: ${prompt}` }]);
+        setInputText('');
+        return processInteraction({ prompt, types, isUpdate: true, origModel, origPrompt });
+      }
+
+      setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: prompt }]);
+      setInputText('');
+      processInteraction({ prompt, types });
+    }, 400);
   };
 
-  /* ── Update / delta diagram ── */
-  const updateDiagram = async (updatePrompt, origPrompt, types) => {
-    if (!apiKey) { showToast('Set VITE_GEMINI_API_KEY in your .env file', 'err'); return; }
-    const content = `Update this system's diagrams.\n\nORIGINAL:\n${origPrompt}\n\nUPDATE:\n${updatePrompt}\n\nApply changes. Return updated Mermaid for types: ${types.join(', ')}\nPrefix each: // TYPE:<type>\nSeparate with: ---DIAGRAM---`;
-    setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: `🔄 Update: ${updatePrompt}` }]);
-    setInputText('');
-    setIsLoading(true);
-    try {
-      const raw      = await callGeminiAPI(DIAGRAM_SYSTEM_PROMPT, content);
-      const diagrams = parseDiagrams(raw);
-      const aiMsg    = { id: (Date.now()+1).toString(), role: 'ai', text: `Updated: ${Object.keys(diagrams).join(', ')}`, diagrams, prompt: origPrompt };
-      setMessages(prev => [...prev, aiMsg]);
-      setActiveDiagramMsg(aiMsg.id);
-      setActiveDiagramType(Object.keys(diagrams)[0] || null);
-    } catch (err) { showToast(err.message, 'err'); }
-    finally { setIsLoading(false); }
-  };
+
 
   /* ── Export helpers ── */
   const copySource = () => { if (shownCode) { navigator.clipboard.writeText(shownCode); showToast('Copied to clipboard'); } };
@@ -718,7 +603,7 @@ export default function App() {
                   {/* Update button */}
                   {msg.role === 'ai' && msg.diagrams && Object.keys(msg.diagrams).length > 0 && (
                     <button className="ia-btn" style={{ alignSelf: 'flex-start' }}
-                      onClick={() => { setUpdateTarget({ origPrompt: msg.prompt || '' }); setInputText(''); setIsJsonMode(false); }}>
+                      onClick={() => { setUpdateTarget({ origPrompt: msg.prompt || '', origModel: msg.model }); setInputText(''); setIsJsonMode(false); }}>
                       <IcRefresh /> Update diagram
                     </button>
                   )}
