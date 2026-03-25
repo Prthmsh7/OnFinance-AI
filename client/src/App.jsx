@@ -38,11 +38,8 @@ const IcEdit    = () => <Ico path={['M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2
 
 /* ─── Constants ─────────────────────────────────────── */
 const DIAGRAM_TYPES = [
-  // { id: 'sequenceDiagram',  label: 'Sequence'  },
   { id: 'classDiagram',     label: 'Class'     },
   { id: 'flowchart',        label: 'Flowchart' },
-  // { id: 'stateDiagram-v2',  label: 'State'     },
-  // { id: 'componentDiagram', label: 'Component' },
 ];
 const DEFAULT_TYPES = ['classDiagram', 'flowchart'];
 
@@ -55,33 +52,41 @@ const EXAMPLES = [
 
 const UNIFIED_PROCESS_PROMPT = `You are a systems analyst and Mermaid.js expert. Analyze the following request.
 Return a valid JSON object containing:
-1. "standardized_prompt": A concise, formal "canonical" version of the description.
-2. "model": The structured system model (entities, interactions, classes, etc.).
-3. "diagrams": A dictionary where keys are diagram types (sequenceDiagram, flowchart, etc.) and values are full Mermaid.js code.
+1. "standardized_prompt": A comprehensive, formal canonical version of the system.
+2. "model": A granular system model with "entities" (ALL unique actors/items mentioned), "interactions" (flows/relationships), and "attributes".
+3. "diagrams": A dictionary where keys are diagram types (classDiagram, flowchart) and values are full Mermaid.js code.
 
 RULES for Model:
-- Use consistent entity IDs (CamelCase).
-- Extract classes, interactions, and data flows.
+- BE GRANULAR: Extract every specific component (e.g., if "Maths" and "Physics" are courses, list "Maths Course" and "Physics Course" as distinct entities).
+- The "model" must contain every element shown in the diagrams.
 
 RULES for Diagrams:
 - Use Mermaid v10+ syntax.
-// - sequenceDiagram: use participant/actor.
 - flowchart: use flowchart TD.
 - classDiagram: use ~T~ for generics. No angle brackets. Visibility: + public, - private. No colon before return type (+method() String).
-// - componentDiagram: use flowchart TD + subgraph.
 
 Return ONLY valid JSON - no markdown, no prose.`;
 
 const UNIFIED_UPDATE_PROMPT = `You are a systems analyst and Mermaid.js expert. Update an existing system.
-Return a valid JSON object containing:
-1. "standardized_prompt": A canonical description of the UPDATED system.
-2. "model": The full updated system model.
-3. "diagrams": All updated Mermaid diagrams.
+Your goal is to perform an INCREMENTAL, IN-PLACE EDIT of the existing diagrams.
 
-Current Model:
+Return a valid JSON object containing:
+1. "standardized_prompt": An updated canonical description of the entire system.
+2. "model": THE FULL UPDATED system model (all previous elements + new additions).
+3. "diagrams": THE FULL UPDATED Mermaid diagrams.
+
+Current System Model (JSON):
 {{CURRENT_MODEL}}
 
-Follow same rules for JSON, Model, and Diagrams as the primary analysis.
+Current Diagrams (Source Code):
+{{CURRENT_DIAGRAMS}}
+
+STRICT EDITING RULES:
+- PRESERVE: Keep all existing node IDs, labels, and class names exactly as they are.
+- ADDITIVE: Focus on adding the new functionality/components.
+- CONTINUITY: Do not change the existing layout, styles, or organizational patterns unless it's strictly necessary for the new requirement.
+- CONSISTENCY: Every new element in the diagrams MUST have a corresponding entry in the "model" JSON.
+
 Return ONLY valid JSON.`;
 
 /* ─── Cache ─── */
@@ -102,81 +107,122 @@ function normalizePrompt(text) {
 
 /* ─── Mermaid sanitizers ────────────────────────────── */
 
+/* ─── Semantic Fuzzy Cache ─── */
+const STOP_WORDS = new Set(['a', 'an', 'the', 'and', 'or', 'to', 'for', 'with', 'by', 'of', 'in', 'on', 'at', 'from', 'as', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'can', 'could', 'should', 'would', 'may', 'might', 'must', 'shall', 'will', 'simple', 'basic', 'small', 'large', 'big', 'cool', 'awesome', 'great', 'fast', 'quick', 'slow', 'very', 'extremely', 'really', 'quite', 'just', 'only', 'also', 'too', 'well', 'fine', 'where', 'when', 'how', 'why', 'who', 'which', 'that', 'this', 'these', 'those', 'some', 'any', 'none', 'each', 'every', 'other', 'another', 'many', 'few', 'little', 'much', 'more', 'most', 'such', 'so', 'then', 'now', 'here', 'there', 'even', 'also', 'else', 'etc', 'build', 'create', 'make', 'generate', 'website', 'app', 'application', 'system', 'allows', 'ability', 'want', 'need', 'please', 'help', 'show', 'list', 'using', 'based', 'allow', 'view', 'display', 'different', 'various', 'explore', 'browse', 'place', 'order', 'online', 'details', 'information', 'info']);
+
+const getBigrams = (str) => {
+  const s = str.toLowerCase().replace(/[^\w\s]/g, '').replace(/\s+/g, '');
+  if (s.length < 2) return new Set();
+  const bi = new Set();
+  for (let i = 0; i < s.length - 1; i++) bi.add(s.slice(i, i + 2));
+  return bi;
+};
+
+const getSimilarity = (s1, s2) => {
+  const b1 = getBigrams(s1);
+  const b2 = getBigrams(s2);
+  if (b1.size === 0 || b2.size === 0) return 0;
+  let intersect = 0;
+  for (const b of b1) if (b2.has(b)) intersect++;
+  return (2 * intersect) / (b1.size + b2.size);
+};
+
+const findFuzzyMatch = (prompt) => {
+  if (!prompt || prompt.length < 10) return null;
+  let best = null;
+  let maxS = 0;
+  for (const [key, val] of cache.entries()) {
+    if (key.startsWith('std:')) {
+      const sim = getSimilarity(prompt, key.slice(4));
+      // Sorensen-Dice threshold: 0.55-0.60 is generally strong for rephrasing
+      if (sim > maxS && sim >= 0.55) { maxS = sim; best = { std: val, sim }; }
+    }
+  }
+  return best;
+};
+
+/* ─── Mermaid sanitizers ─── */
 function sanitizeClassDiagram(raw) {
-  // Fix generics: List<X> → List~X~  (handle nested and multi-param generics)
   let code = raw
     .replace(/^(\s*[+\-#~]\w[\w.]*)\s*<([^>\n]+)>/gm, (_, p, i) => `${p}~${i}~`)
     .replace(/(\w+)<([A-Za-z_][\w, ]*)>/g, (_, c, i) => `${c}~${i}~`)
     .replace(/<([^~>\n]{1,40})>/g, '~$1~');
-  // Fix colon return types: +method() : void → +method() void
-  code = code.replace(/^(\s*[+\-#~][^\n]+)\)\s*:\s*([\w~]+)\s*$/gm, '$1 $2');
-  // Remove standalone <<stereotype>> lines
-  code = code.replace(/^\s*<<[^>]+>>\s*$/gm, '');
-  // Remove abstract/interface modifiers before class keyword
-  code = code.replace(/^(\s*)(abstract|interface)\s+(class\s)/gm, '$1$3');
-  // Remove {abstract} {static} markers
+  // Support both "method() : Type" and "method() Type"
+  code = code.replace(/^(\s*[+\-#~][^\n]+)\)\s*[:]\s*([\w~]+)\s*$/gm, '$1 $2');
+  code = code.replace(/^\s*<<[^>]+>>\s*$/gm, '').replace(/^(\s*)(abstract|interface)\s+(class\s)/gm, '$1$3');
   code = code.replace(/\{abstract\}/g, '').replace(/\{static\}/g, '');
-  // Remove note/link/click/callback lines that some LLMs inject
-  code = code.replace(/^\s*(note\s+for|link\s+|click\s+|callback\s+).*$/gm, '');
-  // Remove namespace blocks (keep content)
-  code = code.replace(/^\s*namespace\s+\w+\s*\{?\s*$/gm, '');
-  // Fix nested class blocks
+  
+  // Basic structural validator: ensure braces are balanced
   const out = []; let depth = 0;
   for (const line of code.split('\n')) {
     const t = line.trim();
     if (!t) { out.push(line); continue; }
-    const isHeader = /^(classDiagram|flowchart|sequenceDiagram|stateDiagram)/.test(t);
-    const isClassOpen = /^class\s+\w[\w~]*\s*\{/.test(t);
-    if (isClassOpen && depth > 0) { out.push('}'); depth = 0; }
-    if (!isHeader) for (const ch of t) { if (ch === '{') depth++; else if (ch === '}') depth = Math.max(0, depth - 1); }
+    if (/^class\s+\w[\w~]*\s*\{/.test(t) && depth > 0) { out.push('}'); depth = 0; }
+    if (!/^(classDiagram|flowchart)/.test(t)) {
+      for (const ch of t) { if (ch === '{') depth++; else if (ch === '}') depth = Math.max(0, depth - 1); }
+    }
     out.push(line);
   }
   while (depth-- > 0) out.push('}');
   return out.join('\n');
 }
 
-function sanitizeSequenceDiagram(code) {
-  return code.replace(
-    /^(\s*(?:participant|actor)\s+)([\w ]+?)(\s*(?:as\s+.*)?$)/gm,
-    (_, kw, name, rest) => { const n = name.trim(); return n.includes(' ') ? `${kw}"${n}"${rest}` : `${kw}${n}${rest}`; }
-  );
-}
-
-function convertComponentToFlowchart(code) {
-  const out = []; let hasHeader = false;
-  for (const raw of code.split('\n')) {
-    const t = raw.trim();
-    if (/^flowchart/.test(t)) { out.push(raw); hasHeader = true; continue; }
-    if (/^componentDiagram/.test(t)) { if (!hasHeader) { out.push('flowchart TD'); hasHeader = true; } continue; }
-    if (!hasHeader) { out.push('flowchart TD'); hasHeader = true; }
-    if (/^<<[^>]+>>$/.test(t)) continue;
-    const pkg = t.match(/^(?:package|system|boundary)\s+["']?([\w\s-]+)["']?\s*\{?$/);
-    if (pkg) { out.push(`subgraph ${pkg[1].trim().replace(/\s+/g, '_')}`); continue; }
-    if (t === '}') { out.push('end'); continue; }
-    const comp = t.match(/^(?:component|node)\s+["']?([\w\s-]+)["']?(?:\s+as\s+(\w+))?/);
-    if (comp) { const l = comp[1].trim(); out.push(`${comp[2] || l.replace(/\s+/g, '_')}[${l}]`); continue; }
-    const brk = t.match(/^\[([\w\s-]+)\](?:\s+as\s+(\w+))?/);
-    if (brk) { const l = brk[1].trim(); out.push(`${brk[2] || l.replace(/\s+/g, '_')}[${l}]`); continue; }
-    const iface = t.match(/^(?:interface|database)\s+["']?([\w\s-]+)["']?(?:\s+as\s+(\w+))?/);
-    if (iface) { const l = iface[1].trim(); out.push(`${iface[2] || l.replace(/\s+/g, '_')}([${l}])`); continue; }
-    out.push(raw.replace(/<<[^>]+>>/g, '').replace(/\(\)/g, ''));
-  }
-  return out.join('\n');
-}
-
 function sanitizeMermaid(code, type) {
-  let out = code;
-  if (type === 'classDiagram' || type === 'classDiagram-v2') out = sanitizeClassDiagram(out);
-  else if (type === 'sequenceDiagram') out = sanitizeSequenceDiagram(out);
-  else if (type === 'componentDiagram') out = convertComponentToFlowchart(out);
-  else if (type === 'flowchart') out = out.replace(/(\[|\()([^\])]*)<([^>]*)>([^\])]*)/g, (_, o, p, i, q) => `${o}${p}&lt;${i}&gt;${q}`);
-  // Strip Windows CR characters
-  out = out.replace(/\r/g, '');
-  // Collapse whitespace-only lines
-  out = out.replace(/^\s+$/gm, '');
-  // Remove trailing semicolons ONLY on relation/arrow lines (not state labels which use semicolons legitimately)
-  out = out.replace(/^(\s*(?:[\w"]+\s*[-=.]+>|-->|--|==)[^\n]*);\s*$/gm, '$1');
-  return out;
+  if (!code || typeof code !== 'string') return '';
+  let out = code.replace(/```mermaid\n?|```/g, '').trim();
+  out = out.replace(/^mermaid\s+/i, '').trim(); // Remove leading "mermaid" word
+  
+  // Detect type if it's generic and we know what we want
+  const inferred = inferMermaidType(out);
+  const actualType = type && isNaN(type) ? type : inferred;
+
+  if (actualType === 'classDiagram') {
+    out = sanitizeClassDiagram(out);
+    if (!out.startsWith('classDiagram')) out = 'classDiagram\n' + out;
+  } else if (actualType === 'flowchart') {
+    if (!out.startsWith('flowchart')) out = 'flowchart TD\n' + out;
+    out = out.replace(/(\[|\()([^\])]*)<([^>]*)>([^\])]*)/g, (_, o, p, i, q) => `${o}${p}&lt;${i}&gt;${q}`);
+  }
+  return out.replace(/\r/g, '').replace(/^\s+$/gm, '');
+}
+
+function inferMermaidType(code) {
+  if (code.includes('classDiagram')) return 'classDiagram';
+  if (code.includes('flowchart') || code.includes('graph')) return 'flowchart';
+  return 'flowchart';
+}
+
+function normalizeDiagrams(raw) {
+  if (!raw) return {};
+  const normalized = {};
+  if (Array.isArray(raw)) {
+    raw.forEach((item, idx) => {
+      const code = typeof item === 'string' ? item : (item.code || item.mermaid || '');
+      const type = (item.type || item.id || inferMermaidType(code) || `diagram-${idx}`);
+      if (code) normalized[type] = code;
+    });
+  } else {
+    Object.entries(raw).forEach(([key, val]) => {
+      const code = typeof val === 'string' ? val : (val.code || val.mermaid || '');
+      const type = isNaN(key) ? key : (inferMermaidType(code) || `diagram-${key}`);
+      if (code) normalized[type] = code;
+    });
+  }
+  return normalized;
+}
+
+function extractJson(text) {
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start === -1 || end === -1 || end < start) return null;
+  try {
+    return JSON.parse(text.slice(start, end + 1));
+  } catch (e) {
+    console.warn('[JSON Extract Error]', e);
+    // Try to fix common issues like trailing commas
+    const fixed = text.slice(start, end + 1).replace(/,(\s*[}\]])/g, '$1');
+    try { return JSON.parse(fixed); } catch { return null; }
+  }
 }
 
 
@@ -242,7 +288,12 @@ function FeedbackRow({ prompt, diagramCode }) {
    ROOT APP
 ═══════════════════════════════════════════════════════ */
 export default function App() {
-  const apiKey = import.meta.env.VITE_GEMINI_API_KEY || localStorage.getItem('gemini_key') || '';
+  /* ─── API Key ─── */
+  const apiKey = import.meta.env.VITE_GEMINI_API_KEY || localStorage.getItem('VITE_GEMINI_API_KEY');
+
+  useEffect(() => {
+    document.title = "UML Generator | AI Systems Modeling";
+  }, []);
 
   // Chat state
   const [messages, setMessages]         = useState([]);
@@ -264,8 +315,9 @@ export default function App() {
   const [updateTarget, setUpdateTarget] = useState(null); // { origPrompt, origModel }
 
   // Layout
-  const [splitPct, setSplitPct]     = useState(50);
-  const [showSessions, setShowSessions] = useState(false);
+  const [splitPct, setSplitPct]             = useState(25);
+  const [inventoryPct, setInventoryPct]     = useState(20);
+  const [showSessions, setShowSessions]     = useState(false);
   const [toast, setToast]           = useState(null);
 
   const textareaRef = useRef(null);
@@ -299,14 +351,28 @@ export default function App() {
     textareaRef.current.style.height = Math.min(textareaRef.current.scrollHeight, 180) + 'px';
   }, [inputText]);
 
-  /* ── Drag-to-resize ── */
-  const startDrag = (e) => {
+  /* ─── Drag-to-resize ─── */
+  const startDrag = (e, side) => {
     e.preventDefault();
     isDragging.current = true;
     const onMove = (ev) => {
       if (!isDragging.current || !appRef.current) return;
-      const pct = ((ev.clientX - appRef.current.getBoundingClientRect().left) / appRef.current.offsetWidth) * 100;
-      setSplitPct(Math.min(Math.max(pct, 25), 75));
+      const rect = appRef.current.getBoundingClientRect();
+      const pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      
+      if (side === 'left') {
+        setSplitPct(prev => {
+          // Keep at least 15% for the middle panel
+          const newLeft = Math.min(Math.max(pct, 15), 100 - inventoryPct - 15);
+          return newLeft;
+        });
+      } else {
+        setInventoryPct(prev => {
+          // Keep at least 15% for the middle panel
+          const newRight = Math.min(Math.max(100 - pct, 15), 100 - splitPct - 15);
+          return newRight;
+        });
+      }
     };
     const onUp = () => { isDragging.current = false; window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
     window.addEventListener('mousemove', onMove);
@@ -320,45 +386,49 @@ export default function App() {
       contents: [{ role: 'user', parts: [{ text: userContent }] }],
       generationConfig: { temperature: 0, topK: 1, topP: 0.1, maxOutputTokens: 8192 },
     });
-    const tryModel = async (model) => {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
-      const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal });
-      if (!res.ok) {
-        const msg = (await res.json().catch(() => ({}))).error?.message || res.statusText;
-        const isQuota = res.status === 429 || msg.toLowerCase().includes('quota');
-        throw Object.assign(new Error(isQuota ? 'Quota exceeded — wait ~1 min or enable billing at console.cloud.google.com.' : msg), { isQuota });
-      }
-      return (await res.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
-    };
-    try { return await tryModel('gemini-2.5-flash-lite'); }
-    catch (err) {
-      if (err.name === 'AbortError') throw err;
-      if (err.isQuota) return await tryModel('gemini-2.5-flash');
-      throw err;
+    
+    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent?key=${apiKey}`;
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body, signal });
+
+    if (!res.ok) {
+      const msg = (await res.json().catch(() => ({}))).error?.message || res.statusText;
+      const isQuota = res.status === 429 || msg.toLowerCase().includes('quota');
+      throw Object.assign(new Error(isQuota ? 'Gemini Quota exceeded — wait ~1 min.' : msg), { isQuota });
     }
+    
+    return (await res.json()).candidates?.[0]?.content?.parts?.[0]?.text || '';
   };
 
-  const unifiedAIProcess = async (userInput, types, origModel = null, signal = null, cacheKey = null) => {
+  const unifiedAIProcess = async (userInput, types, origModel = null, origDiagrams = null, signal = null, cacheKey = null) => {
+    const diagramsText = Object.entries(origDiagrams || {})
+      .map(([type, code]) => `### ${type}\n${code}`)
+      .join('\n\n');
+
     const sys = origModel 
-      ? UNIFIED_UPDATE_PROMPT.replace('{{CURRENT_MODEL}}', JSON.stringify(origModel, null, 2))
+      ? UNIFIED_UPDATE_PROMPT
+          .replace('{{CURRENT_MODEL}}', JSON.stringify(origModel, null, 2))
+          .replace('{{CURRENT_DIAGRAMS}}', diagramsText)
       : UNIFIED_PROCESS_PROMPT;
     
     const userContent = origModel 
-      ? `UPDATE REQUEST: ${userInput}\nApply to existing model.`
+      ? `ORIGINAL SYSTEM: ${cacheKey.split('|')[0] || 'Unknown'}\nUPDATE REQUEST: ${userInput}`
       : userInput;
 
     console.log('[Gemini API Call]', { type: origModel ? 'update' : 'extract', length: userInput.length });
     const raw = await callGeminiAPI(sys, userContent, signal);
-    const jsonStart = raw.indexOf('{');
-    if (jsonStart === -1) throw new Error('AI returned no JSON content');
-    const data = JSON.parse(raw.slice(jsonStart, raw.lastIndexOf('}') + 1));
+    const data = extractJson(raw);
     
-    if (!data.model || !data.diagrams) throw new Error('Incomplete AI response — missing model or diagrams');
+    if (!data || !data.model || !data.diagrams) {
+      console.error('[AI Content Error]', { raw, data });
+      throw new Error('AI returned invalid or incomplete data structure');
+    }
+    
     const std = data.standardized_prompt || userInput;
+    const diagrams = normalizeDiagrams(data.diagrams);
 
     // Sanitize diagrams
-    for (const t of Object.keys(data.diagrams)) {
-      data.diagrams[t] = sanitizeMermaid(data.diagrams[t], t);
+    for (const t of Object.keys(diagrams)) {
+      diagrams[t] = sanitizeMermaid(diagrams[t], t);
     }
 
     // Cache results
@@ -366,13 +436,13 @@ export default function App() {
     cache.set(stdKey, std);
     const normStd = normalizePrompt(std);
     cache.set('model:' + normStd, JSON.stringify(data.model));
-    cache.set(normStd + '|' + [...types].sort().join(',') + ':diagrams', JSON.stringify(data.diagrams));
+    cache.set(normStd + '|' + [...types].sort().join(',') + ':diagrams', JSON.stringify(diagrams));
     persistCache();
 
-    return data;
+    return { ...data, diagrams };
   };
 
-  const processInteraction = async ({ prompt, types, isUpdate = false, origModel = null, origPrompt = null }) => {
+  const processInteraction = async ({ prompt, types, isUpdate = false, origModel = null, origPrompt = null, origDiagrams = null }) => {
     if (abortController.current) abortController.current.abort();
     abortController.current = new AbortController();
     const signal = abortController.current.signal;
@@ -388,10 +458,18 @@ export default function App() {
       setLoadingStage('analysing');
       const fullContext = isUpdate ? `${origPrompt} ${prompt}` : prompt;
       const normInput = normalizePrompt(fullContext);
-      const stdKey = 'std:' + normInput;
+      const stdKey = 'std:' + normInput + (isUpdate ? ':update' : '');
 
       let stdPrompt = cache.has(stdKey) ? cache.get(stdKey) : null;
       let model = null, diagrams = null;
+
+      if (!stdPrompt && !isUpdate) {
+        const fuzzy = findFuzzyMatch(fullContext);
+        if (fuzzy) {
+          stdPrompt = fuzzy.std;
+          console.log(`[REQ_${rid}] FUZZY CACHE HIT (Sim: ${fuzzy.sim.toFixed(2)}). 0 API calls.`);
+        }
+      }
 
       if (stdPrompt) {
         const normStd = normalizePrompt(stdPrompt);
@@ -405,7 +483,7 @@ export default function App() {
         console.log(`[REQ_${rid}] CACHE HIT. 0 API calls.`);
       } else {
         console.log(`[REQ_${rid}] CACHE MISS. Sending 1 Gemini API call...`);
-        const result = await unifiedAIProcess(prompt, types, origModel, signal, stdKey);
+        const result = await unifiedAIProcess(prompt, types, origModel, origDiagrams, signal, stdKey);
         model = result.model;
         diagrams = result.diagrams;
         stdPrompt = result.standardized_prompt;
@@ -422,6 +500,7 @@ export default function App() {
       setMessages(prev => [...prev, aiMsg]);
       setActiveDiagramMsg(aiMsg.id);
       setActiveDiagramType(Object.keys(diagrams)[0] || null);
+      setLoadingStage('');
 
       if (!isUpdate) {
         setSessions(prev => [{ id: aiMsg.id, name: prompt.slice(0, 40) + (prompt.length > 40 ? '…' : ''), types }, ...prev]);
@@ -461,11 +540,11 @@ export default function App() {
       }
 
       if (updateTarget) {
-        const { origPrompt, origModel } = updateTarget;
+        const { origPrompt, origModel, origDiagrams } = updateTarget;
         setUpdateTarget(null);
         setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: `🔄 Update: ${prompt}` }]);
         setInputText('');
-        return processInteraction({ prompt, types, isUpdate: true, origModel, origPrompt });
+        return processInteraction({ prompt, types, isUpdate: true, origModel, origPrompt, origDiagrams });
       }
 
       setMessages(prev => [...prev, { id: Date.now().toString(), role: 'user', text: prompt }]);
@@ -601,12 +680,12 @@ export default function App() {
                   )}
 
                   {/* Update button */}
-                  {msg.role === 'ai' && msg.diagrams && Object.keys(msg.diagrams).length > 0 && (
-                    <button className="ia-btn" style={{ alignSelf: 'flex-start' }}
-                      onClick={() => { setUpdateTarget({ origPrompt: msg.prompt || '', origModel: msg.model }); setInputText(''); setIsJsonMode(false); }}>
-                      <IcRefresh /> Update diagram
-                    </button>
-                  )}
+                    {msg.role === 'ai' && msg.diagrams && Object.keys(msg.diagrams).length > 0 && (
+                      <button className="ia-btn" style={{ alignSelf: 'flex-start' }}
+                        onClick={() => { setUpdateTarget({ origPrompt: msg.prompt || '', origModel: msg.model, origDiagrams: msg.diagrams }); setInputText(''); setIsJsonMode(false); }}>
+                        <IcRefresh /> Update diagram
+                      </button>
+                    )}
 
                   {/* Feedback */}
                   {msg.role === 'ai' && msg.diagrams && (
@@ -688,11 +767,11 @@ export default function App() {
         </div>
       </section>
 
-      {/* ════ DRAG HANDLE ════ */}
-      <div className="drag-handle" onMouseDown={startDrag} title="Drag to resize" />
+      {/* ════ DRAG HANDLE (Left) ════ */}
+      <div className="drag-handle" onMouseDown={(e) => startDrag(e, 'left')} title="Drag to resize" />
 
       {/* ════ DIAGRAM PANEL ════ */}
-      <section className="diagram-panel" style={{ width: `${100 - splitPct}%` }}>
+      <section className="diagram-panel">
 
         {/* Header */}
         <div className="diagram-header">
@@ -754,6 +833,53 @@ export default function App() {
             <button className="footer-btn" onClick={downloadPng}><IcDown /> PNG</button>
           </div>
         )}
+      </section>
+
+      {/* ════ DRAG HANDLE (Right) ════ */}
+      <div className="drag-handle" onMouseDown={(e) => startDrag(e, 'right')} title="Drag to resize" />
+
+      {/* ════ INVENTORY PANEL ════ */}
+      <section className="inventory-panel" style={{ width: `${inventoryPct}%` }}>
+        <div className="inventory-header">
+          <div className="inventory-title">Components</div>
+          <div className="header-actions">
+            <button className="ia-btn" onClick={() => copySource()} title="Copy Model JSON">
+              <IcCopy /> JSON
+            </button>
+          </div>
+        </div>
+
+        <div className="inventory-content">
+          {currentMsg?.model ? (
+            <>
+              {Object.entries(currentMsg.model).map(([section, items]) => (
+                <div key={section} className="inventory-section">
+                  <div className="inventory-section-title">{section.replace(/_/g, ' ')}</div>
+                  {Array.isArray(items) ? (
+                    items.map((item, idx) => (
+                      <div key={`${section}-${idx}`} className="inventory-item">
+                        <div className="inventory-item-name">
+                          {typeof item === 'string' ? item : (item.name || item.id || `Item ${idx}`)}
+                        </div>
+                        <div className="inventory-item-type">
+                          {typeof item === 'object' && item.type ? item.type : section.replace(/s$/, '').replace(/ie$/, 'y')}
+                        </div>
+                      </div>
+                    ))
+                  ) : (
+                    <pre className="inventory-json">{JSON.stringify(items, null, 2)}</pre>
+                  )}
+                </div>
+              ))}
+            </>
+          ) : (
+            <div className="diagram-empty">
+              <div className="diagram-empty-icon">📁</div>
+              <div className="diagram-empty-text">No components yet</div>
+              <div className="diagram-empty-sub">Generate a diagram to see its<br />internal system model here.</div>
+            </div>
+          )}
+        </div>
       </section>
 
       {toast && <div className={`toast ${toast.type}`}>{toast.msg}</div>}
