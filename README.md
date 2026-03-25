@@ -69,3 +69,7 @@ Built as part of the OnFinnance Assignment.
 
 
 Assignment link : https://p.ip.fi/4IwK
+
+
+A simple messaging app with users and chat rooms
+add video call functionality between users
